@@ -249,16 +249,17 @@ func (t *LLMProviderTransformer) transformProxy(proxy *api.LLMProxyConfiguration
 	// Step 3.5: Apply proxy-level provider auth for proxy->provider loopback upstream
 	// and inline translators declared per additional provider. Both are attached as
 	// conditional policies so they run only when their provider is selected.
+	bodyBasedRouting := llmProxyUsesPolicy(&proxy.Spec, "context-based-routing")
 	var upstreamAuthPolicies []api.Policy
 	var transformerPolicies []api.Policy
 	if proxy.Spec.Provider.Auth != nil {
-		pol, err := t.proxyUpstreamAuthPolicy(proxy.Spec.Provider.Auth, apiKeyAuthValuePrefix(providerConfig.Spec.GlobalPolicies), "provider.auth")
+		pol, err := t.proxyUpstreamAuthPolicy(proxy.Spec.Provider.Auth, apiKeyAuthValuePrefix(providerConfig.Spec.GlobalPolicies), "provider.auth", bodyBasedRouting)
 		if err != nil {
 			return nil, err
 		}
 		// "other"/"none" auth yield no policy - nothing to attach.
 		if pol != nil {
-			condition := selectedProviderExecutionCondition(proxy.Spec.Provider.Id, true)
+			condition := selectedProviderExecutionConditionForPhase(proxy.Spec.Provider.Id, true, bodyBasedRouting)
 			pol.ExecutionCondition = &condition
 			upstreamAuthPolicies = append(upstreamAuthPolicies, *pol)
 		}
@@ -271,13 +272,13 @@ func (t *LLMProviderTransformer) transformProxy(proxy *api.LLMProxyConfiguration
 			}
 
 			if ap.Auth != nil {
-				pol, err := t.proxyUpstreamAuthPolicy(ap.Auth, additionalValuePrefixByID[ap.Id], fmt.Sprintf("additionalProviders[%s].auth", name))
+				pol, err := t.proxyUpstreamAuthPolicy(ap.Auth, additionalValuePrefixByID[ap.Id], fmt.Sprintf("additionalProviders[%s].auth", name), bodyBasedRouting)
 				if err != nil {
 					return nil, err
 				}
 				// "other"/"none" auth yield no policy - nothing to attach.
 				if pol != nil {
-					condition := selectedProviderExecutionCondition(name, false)
+					condition := selectedProviderExecutionConditionForPhase(name, false, bodyBasedRouting)
 					pol.ExecutionCondition = &condition
 					upstreamAuthPolicies = append(upstreamAuthPolicies, *pol)
 				}
@@ -397,8 +398,7 @@ func (t *LLMProviderTransformer) transformProxy(proxy *api.LLMProxyConfiguration
 	// applied across ALL operations as one shared scope, evaluated before operation-level policies.
 	// Append because the proxy may already hold an api-level host-header policy (see Step 3).
 	if proxy.Spec.GlobalPolicies != nil && len(*proxy.Spec.GlobalPolicies) > 0 {
-		gp := make([]api.Policy, len(*proxy.Spec.GlobalPolicies))
-		copy(gp, *proxy.Spec.GlobalPolicies)
+		gp := globalLLMPoliciesWithTemplateParams(proxy.Spec.GlobalPolicies, tmpl)
 		if spec.Policies == nil {
 			spec.Policies = &gp
 		} else {
@@ -752,8 +752,7 @@ func (t *LLMProviderTransformer) transformProvider(provider *api.LLMProviderConf
 	// Global (api-level) policies: route into the derived RestAPI's spec.Policies so they are
 	// applied across ALL operations as one shared scope, evaluated before operation-level policies.
 	if provider.Spec.GlobalPolicies != nil && len(*provider.Spec.GlobalPolicies) > 0 {
-		gp := make([]api.Policy, len(*provider.Spec.GlobalPolicies))
-		copy(gp, *provider.Spec.GlobalPolicies)
+		gp := globalLLMPoliciesWithTemplateParams(provider.Spec.GlobalPolicies, tmpl)
 		if spec.Policies == nil {
 			spec.Policies = &gp
 		} else {
@@ -821,7 +820,7 @@ func apiKeyAuthValuePrefix(globalPolicies *[]api.Policy) string {
 	return ""
 }
 
-func (t *LLMProviderTransformer) proxyUpstreamAuthPolicy(auth *api.LLMUpstreamAuth, valuePrefix, field string) (*api.Policy, error) {
+func (t *LLMProviderTransformer) proxyUpstreamAuthPolicy(auth *api.LLMUpstreamAuth, valuePrefix, field string, bodyPhase bool) (*api.Policy, error) {
 	if auth == nil {
 		return nil, nil
 	}
@@ -843,6 +842,9 @@ func (t *LLMProviderTransformer) proxyUpstreamAuthPolicy(auth *api.LLMUpstreamAu
 		params, err := GetUpstreamAuthApikeyPolicyParams(*auth.Header, value)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build upstream auth params: %w", err)
+		}
+		if bodyPhase {
+			params["request"].(map[string]interface{})["phase"] = "body"
 		}
 		policyVersion, err := t.resolvePolicyVersion(constants.UPSTREAM_AUTH_APIKEY_POLICY_NAME)
 		if err != nil {
@@ -923,6 +925,14 @@ func selectedProviderExecutionCondition(providerName string, includeDefault bool
 	return fmt.Sprintf("'selected_provider' in request.Metadata && %s", selectedExpr)
 }
 
+func selectedProviderExecutionConditionForPhase(providerName string, includeDefault, bodyPhase bool) string {
+	condition := selectedProviderExecutionCondition(providerName, includeDefault)
+	if !bodyPhase {
+		return condition
+	}
+	return fmt.Sprintf("processing.phase == 'request_body' && (%s)", condition)
+}
+
 // GetHostAdditionPolicyParams builds the host-rewrite policy params. Constructed
 // structurally (not via YAML interpolation) so a host value containing a quote or newline
 // cannot break or inject the params.
@@ -961,6 +971,47 @@ func applyExtractionFieldsFromBaseSpec(templateParams map[string]interface{}, sp
 	setExtractionParam(templateParams, "completionTokens", spec.CompletionTokens)
 	setExtractionParam(templateParams, "totalTokens", spec.TotalTokens)
 	setExtractionParam(templateParams, "remainingTokens", spec.RemainingTokens)
+}
+
+func globalLLMPoliciesWithTemplateParams(globalPolicies *[]api.Policy, template *models.StoredLLMProviderTemplate) []api.Policy {
+	if globalPolicies == nil {
+		return nil
+	}
+	result := make([]api.Policy, len(*globalPolicies))
+	for i, attached := range *globalPolicies {
+		result[i] = attached
+		if attached.Name != "context-based-routing" || template == nil {
+			continue
+		}
+		templateParams := make(map[string]interface{})
+		spec := template.Configuration.Spec
+		setExtractionParam(templateParams, "requestModel", spec.RequestModel)
+		base := map[string]interface{}{}
+		if attached.Params != nil {
+			base = *attached.Params
+		}
+		result[i].Params = mergeParams(base, templateParams)
+	}
+	return result
+}
+
+func llmProxyUsesPolicy(spec *api.LLMProxyConfigData, policyName string) bool {
+	if spec == nil {
+		return false
+	}
+	if spec.GlobalPolicies != nil {
+		for _, attached := range *spec.GlobalPolicies {
+			if attached.Name == policyName {
+				return true
+			}
+		}
+	}
+	for _, attached := range collectOperationLevelLLMPolicies(spec.OperationPolicies, spec.Policies) {
+		if attached.Name == policyName {
+			return true
+		}
+	}
+	return false
 }
 
 func applyExtractionFieldsFromMapping(templateParams map[string]interface{}, mapping *api.LLMProviderTemplateResourceMapping) {

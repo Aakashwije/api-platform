@@ -381,6 +381,21 @@ func (v *LLMValidator) validateExtractionIdentifier(
 		}
 	}
 
+	if identifier.Location == "pathParam" && identifier.Identifier != "" {
+		expression, err := regexp.Compile(identifier.Identifier)
+		if err != nil {
+			errors = append(errors, ValidationError{
+				Field:   fmt.Sprintf("%s.identifier", fieldPrefix),
+				Message: fmt.Sprintf("pathParam identifier must be a valid Go regular expression: %v", err),
+			})
+		} else if expression.NumSubexp() == 0 {
+			errors = append(errors, ValidationError{
+				Field:   fmt.Sprintf("%s.identifier", fieldPrefix),
+				Message: "pathParam identifier must contain a capture group for the model value",
+			})
+		}
+	}
+
 	return errors
 }
 
@@ -781,6 +796,10 @@ func (v *LLMValidator) validateProxyData(spec *api.LLMProxyConfigData) []Validat
 
 	// The deprecated `policies` list must not coexist with the new policy lists
 	errors = append(errors, v.validatePolicyListExclusivity(spec.GlobalPolicies, spec.OperationPolicies, spec.Policies)...)
+
+	// Body-derived context routing references provider aliases and must not
+	// overlap another policy that also selects the model or provider.
+	errors = append(errors, validateContextBasedRoutingPolicies(spec)...)
 
 	// Validate API-level resilience (timeout / idleTimeout). LLM kinds support resilience at
 	// the API level only.
